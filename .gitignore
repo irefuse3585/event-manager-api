@@ -1,9 +1,27 @@
+# Python кеш и байт-код
 __pycache__/
 *.py[cod]
-.env
+
+# Виртуальное окружение
 venv/
+
+# Переменные окружения
+.env
+
+# Логи, файлы БД
+*.log
 *.sqlite3
-dist/
-build/
-*.egg-info/
-migrations/versions/
+
+# Pytest cache
+.pytest_cache/
+
+# Coverage
+htmlcov/
+.coverage
+
+# IDE и редакторы (если вы не хотите делиться своими настройками)
+# .vscode/
+# .idea/
+
+# Docker-артефакты
+docker-compose.override.yml
