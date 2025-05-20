@@ -25,7 +25,6 @@ async def register_user(db: AsyncSession, data: LoginRequest) -> User:
     - hash the password
     - insert into DB
     """
-    # Check uniqueness
     stmt = select(User).where(
         (User.username == data.username) | (User.email == data.email)
     )
@@ -33,7 +32,6 @@ async def register_user(db: AsyncSession, data: LoginRequest) -> User:
     if exists:
         raise ConflictError("Username or email already registered")
 
-    # Hash password and save
     hashed = get_password_hash(data.password)
     user = User(username=data.username, email=data.email, hashed_password=hashed)
     db.add(user)
@@ -74,8 +72,9 @@ def refresh_access_token(token: str) -> str:
         user_id = payload.get("sub")
         if not user_id:
             raise UnauthorizedError("Token payload missing subject")
-    except JWTError:
+    except (JWTError, ValueError):
+        # catch both JWT-specific errors and malformed-token ValueError
         raise UnauthorizedError("Invalid token")
-    # Issue new token
+
     expire = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     return create_access_token(subject=user_id, expires_delta=expire)
