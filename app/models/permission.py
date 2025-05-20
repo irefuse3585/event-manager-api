@@ -1,11 +1,11 @@
 import uuid
 
-from sqlalchemy import Column, Enum, ForeignKey
+from sqlalchemy import Enum, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
-from app.models.enums import PermissionRole  # Enum для ролей доступа
+from app.models.enums import PermissionRole
 
 
 class Permission(Base):
@@ -16,22 +16,24 @@ class Permission(Base):
     __tablename__ = "permissions"
 
     # Primary key
-    id = Column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
 
     # Foreign keys to event and user
-    event_id = Column(
+    event_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True),
         ForeignKey("events.id", ondelete="CASCADE"),
         nullable=False,
     )
-    user_id = Column(
+    user_id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
     )
 
     # Role: Owner, Editor or Viewer
-    role = Column(Enum(PermissionRole), nullable=False)
+    role: Mapped[PermissionRole] = mapped_column(Enum(PermissionRole), nullable=False)
 
     # Relations
     event = relationship("Event", back_populates="permissions")
