@@ -19,9 +19,9 @@ venv/
 htmlcov/
 .coverage
 
-# IDE и редакторы (если вы не хотите делиться своими настройками)
-# .vscode/
-# .idea/
+# IDE и редакторы
+.vscode/
+.idea/
 
 # Docker-артефакты
 docker-compose.override.yml
