@@ -1,6 +1,8 @@
 import uuid
 
-from sqlalchemy import Boolean, Enum, String
+from sqlalchemy import Boolean
+from sqlalchemy import Enum as SAEnum
+from sqlalchemy import String
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -38,7 +40,13 @@ class User(Base):
 
     # Global role: Admin, User, etc.
     role: Mapped[UserRole] = mapped_column(
-        Enum(UserRole), nullable=False, default=UserRole.USER
+        SAEnum(
+            UserRole,
+            name="user_role",
+            native_enum=False,
+        ),
+        nullable=False,
+        default=UserRole.USER,
     )
 
     # Relationship: one user → many events
