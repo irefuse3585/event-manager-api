@@ -1,6 +1,7 @@
 import uuid
 
-from sqlalchemy import Enum, ForeignKey
+from sqlalchemy import Enum as SAEnum
+from sqlalchemy import ForeignKey
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -33,7 +34,15 @@ class Permission(Base):
     )
 
     # Role: Owner, Editor or Viewer
-    role: Mapped[PermissionRole] = mapped_column(Enum(PermissionRole), nullable=False)
+    role: Mapped[PermissionRole] = mapped_column(
+        SAEnum(
+            PermissionRole,
+            name="permission_role",
+            native_enum=False,
+        ),
+        nullable=False,
+        default=PermissionRole.VIEWER,
+    )
 
     # Relations
     event = relationship("Event", back_populates="permissions")
