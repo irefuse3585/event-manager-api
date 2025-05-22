@@ -1,5 +1,6 @@
-# app/core/secutity.py
+# app/core/security.py
 
+import logging
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
@@ -12,19 +13,32 @@ from app.core.config import settings
 # Password hashing context (bcrypt)
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# Security logger for logging important security events and errors
+security_logger = logging.getLogger("app.security")
+
 
 def get_password_hash(password: str) -> str:
     """
     Hash plaintext password using bcrypt.
     """
-    return pwd_context.hash(password)
+    try:
+        return pwd_context.hash(password)
+    except Exception as exc:
+        # Log hashing failures as critical security errors
+        security_logger.critical("Password hashing failed: %s", exc, exc_info=True)
+        raise
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """
     Verify plaintext password against stored bcrypt hash.
     """
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception as exc:
+        # Log password verification failures
+        security_logger.warning("Password verification failed: %s", exc, exc_info=True)
+        return False
 
 
 def _now() -> datetime:
@@ -65,6 +79,7 @@ def create_access_token(
 def decode_access_token(token: str) -> Dict[str, Any]:
     """
     Decode and validate a JWT access token, verifying audience and issuer.
+    Log errors if decoding fails (could be expired/invalid token or attack).
     """
     try:
         return jwt.decode(
@@ -75,6 +90,8 @@ def decode_access_token(token: str) -> Dict[str, Any]:
             issuer=settings.JWT_ISSUER,
         )
     except JWTError as e:
+        # Log failed token decoding
+        security_logger.warning("Access token decode failed: %s", e)
         raise ValueError("Invalid access token") from e
 
 
@@ -97,17 +114,20 @@ def create_refresh_token(
         "iss": settings.JWT_ISSUER,
         "aud": settings.JWT_AUDIENCE,
     }
-    token = jwt.encode(
-        payload,
-        settings.REFRESH_TOKEN_SECRET,
-        algorithm=settings.REFRESH_TOKEN_ALGORITHM,
+    return (
+        jwt.encode(
+            payload,
+            settings.REFRESH_TOKEN_SECRET,
+            algorithm=settings.REFRESH_TOKEN_ALGORITHM,
+        ),
+        jti,
     )
-    return token, jti
 
 
 def decode_refresh_token(token: str) -> Dict[str, Any]:
     """
     Decode and validate a JWT refresh token, verifying audience and issuer.
+    Log errors if decoding fails.
     """
     try:
         return jwt.decode(
@@ -118,4 +138,5 @@ def decode_refresh_token(token: str) -> Dict[str, Any]:
             issuer=settings.JWT_ISSUER,
         )
     except JWTError as e:
+        security_logger.warning("Refresh token decode failed: %s", e)
         raise ValueError("Invalid refresh token") from e
