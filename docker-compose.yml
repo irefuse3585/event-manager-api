@@ -1,7 +1,6 @@
 services:
   api:
     build: .
-    # Explicit container name for the API service
     container_name: event-manager-api
     ports:
       - "8000:8000"
@@ -9,6 +8,8 @@ services:
     depends_on:
       - db
       - redis
+    volumes:
+      - ./logs:/app/logs
 
   db:
     image: postgres:latest
