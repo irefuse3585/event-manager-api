@@ -1,18 +1,18 @@
 # app/services/auth_service.py
 
-from datetime import timedelta
+from datetime import datetime
 
-from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.security import (
     create_access_token,
-    decode_access_token,
+    create_refresh_token,
+    decode_refresh_token,
     get_password_hash,
     verify_password,
 )
+from app.db.redis import redis_client
 from app.models.user import User
 from app.schemas.auth import LoginRequest
 from app.utils.exceptions import ConflictError, UnauthorizedError
@@ -28,16 +28,18 @@ async def register_user(db: AsyncSession, data: LoginRequest) -> User:
     stmt = select(User).where(
         (User.username == data.username) | (User.email == data.email)
     )
-    exists = (await db.execute(stmt)).scalars().first()
-    if exists:
+    existing_user = (await db.execute(stmt)).scalars().first()
+    if existing_user:
         raise ConflictError("Username or email already registered")
 
-    hashed = get_password_hash(data.password)
-    user = User(username=data.username, email=data.email, hashed_password=hashed)
-    db.add(user)
+    hashed_password = get_password_hash(data.password)
+    new_user = User(
+        username=data.username, email=data.email, hashed_password=hashed_password
+    )
+    db.add(new_user)
     await db.commit()
-    await db.refresh(user)
-    return user
+    await db.refresh(new_user)
+    return new_user
 
 
 async def authenticate_user(db: AsyncSession, data: LoginRequest) -> User:
@@ -55,26 +57,54 @@ async def authenticate_user(db: AsyncSession, data: LoginRequest) -> User:
     return user
 
 
-def create_access_token_for_user(user: User) -> str:
+async def get_user_by_id(db: AsyncSession, user_id: str) -> User | None:
     """
-    Generate a JWT access token for the given user.
+    Fetch user by UUID (string).
     """
-    expire = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    return create_access_token(subject=str(user.id), expires_delta=expire)
+    stmt = select(User).where(User.id == user_id)
+    return (await db.execute(stmt)).scalars().first()
 
 
-def refresh_access_token(token: str) -> str:
+async def create_access_token_for_user(user: User) -> str:
     """
-    Decode an existing token and issue a new one with reset expiry.
+    Issue access token embedding user's role.
+    """
+    return create_access_token(subject=str(user.id), role=user.role.value)
+
+
+async def create_refresh_token_for_user(user: User) -> str:
+    """
+    Issue refresh token and store its jti in Redis.
+    """
+    token, jti = create_refresh_token(subject=str(user.id))
+    payload = decode_refresh_token(token)
+    ttl = payload["exp"] - int(datetime.utcnow().timestamp())
+    await redis_client.set(f"refresh:jti:{jti}", str(user.id), ex=ttl)
+    return token
+
+
+async def revoke_refresh_token(token: str) -> None:
+    """
+    Revoke a refresh token by deleting its jti from Redis.
     """
     try:
-        payload = decode_access_token(token)
-        user_id = payload.get("sub")
-        if not user_id:
-            raise UnauthorizedError("Token payload missing subject")
-    except (JWTError, ValueError):
-        # catch both JWT-specific errors and malformed-token ValueError
-        raise UnauthorizedError("Invalid token")
+        payload = decode_refresh_token(token)
+        jti = payload.get("jti")
+    except ValueError:
+        return
+    if jti:
+        await redis_client.delete(f"refresh:jti:{jti}")
 
-    expire = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    return create_access_token(subject=user_id, expires_delta=expire)
+
+async def is_refresh_token_revoked(token: str) -> bool:
+    """
+    Check revocation status: if jti missing in Redis, token is revoked.
+    """
+    try:
+        payload = decode_refresh_token(token)
+        jti = payload.get("jti")
+    except ValueError:
+        return True
+    if not jti:
+        return True
+    return not bool(await redis_client.exists(f"refresh:jti:{jti}"))
