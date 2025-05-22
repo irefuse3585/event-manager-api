@@ -1,5 +1,6 @@
 # app/services/auth_service.py
 
+import logging
 from datetime import datetime
 
 from sqlalchemy import select
@@ -17,6 +18,13 @@ from app.models.user import User
 from app.schemas.auth import LoginRequest
 from app.utils.exceptions import ConflictError, UnauthorizedError
 
+# Regular logger for internal operations
+logger = logging.getLogger(__name__)
+# Audit logger for tracking user-related actions
+audit_logger = logging.getLogger("audit")
+# Security logger for warnings and auth failures (optional)
+security_logger = logging.getLogger("app.security")
+
 
 async def register_user(db: AsyncSession, data: LoginRequest) -> User:
     """
@@ -30,6 +38,11 @@ async def register_user(db: AsyncSession, data: LoginRequest) -> User:
     )
     existing_user = (await db.execute(stmt)).scalars().first()
     if existing_user:
+        security_logger.warning(
+            "Registration attempt with existing username or email: %s, %s",
+            data.username,
+            data.email,
+        )
         raise ConflictError("Username or email already registered")
 
     hashed_password = get_password_hash(data.password)
@@ -39,6 +52,15 @@ async def register_user(db: AsyncSession, data: LoginRequest) -> User:
     db.add(new_user)
     await db.commit()
     await db.refresh(new_user)
+    logger.info(
+        "User registered successfully: id=%s username=%s",
+        new_user.id,
+        new_user.username,
+    )
+    audit_logger.info(
+        f"User registered: id={new_user.id} username={new_user.username} "
+        f"email={new_user.email}"
+    )
     return new_user
 
 
@@ -53,7 +75,16 @@ async def authenticate_user(db: AsyncSession, data: LoginRequest) -> User:
     )
     user = (await db.execute(stmt)).scalars().first()
     if not user or not verify_password(data.password, user.hashed_password):
+        security_logger.warning(
+            "Failed login attempt for username=%s or email=%s",
+            data.username,
+            data.email,
+        )
         raise UnauthorizedError("Invalid username/email or password")
+    logger.info("User authenticated: id=%s username=%s", user.id, user.username)
+    audit_logger.info(
+        f"User login: id={user.id} username={user.username} email={user.email}"
+    )
     return user
 
 
@@ -61,14 +92,19 @@ async def get_user_by_id(db: AsyncSession, user_id: str) -> User | None:
     """
     Fetch user by UUID (string).
     """
-    stmt = select(User).where(User.id == user_id)
-    return (await db.execute(stmt)).scalars().first()
+    user = (await db.execute(select(User).where(User.id == user_id))).scalars().first()
+    if user:
+        logger.debug("Fetched user by id: %s", user_id)
+    else:
+        logger.warning("User not found by id: %s", user_id)
+    return user
 
 
 async def create_access_token_for_user(user: User) -> str:
     """
     Issue access token embedding user's role.
     """
+    logger.debug("Issuing access token for user_id=%s role=%s", user.id, user.role)
     return create_access_token(subject=str(user.id), role=user.role.value)
 
 
@@ -80,6 +116,7 @@ async def create_refresh_token_for_user(user: User) -> str:
     payload = decode_refresh_token(token)
     ttl = payload["exp"] - int(datetime.utcnow().timestamp())
     await redis_client.set(f"refresh:jti:{jti}", str(user.id), ex=ttl)
+    logger.debug("Refresh token issued and stored in Redis for user_id=%s", user.id)
     return token
 
 
@@ -91,9 +128,12 @@ async def revoke_refresh_token(token: str) -> None:
         payload = decode_refresh_token(token)
         jti = payload.get("jti")
     except ValueError:
+        logger.warning("Attempted to revoke invalid refresh token")
         return
     if jti:
         await redis_client.delete(f"refresh:jti:{jti}")
+        logger.info("Refresh token revoked: jti=%s", jti)
+        audit_logger.info(f"Refresh token revoked: jti={jti}")
 
 
 async def is_refresh_token_revoked(token: str) -> bool:
@@ -104,7 +144,11 @@ async def is_refresh_token_revoked(token: str) -> bool:
         payload = decode_refresh_token(token)
         jti = payload.get("jti")
     except ValueError:
+        logger.warning("Token revoked check failed: invalid token")
         return True
     if not jti:
+        logger.warning("Token revoked check: missing jti")
         return True
-    return not bool(await redis_client.exists(f"refresh:jti:{jti}"))
+    exists = await redis_client.exists(f"refresh:jti:{jti}")
+    logger.debug("Refresh token jti=%s exists in Redis: %s", jti, bool(exists))
+    return not bool(exists)

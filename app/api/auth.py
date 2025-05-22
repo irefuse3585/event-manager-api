@@ -1,3 +1,6 @@
+# app/api/auth.py
+
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, Response, status
@@ -24,6 +27,10 @@ from app.utils.response import auto_response
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 limiter = Limiter(key_func=get_remote_address)
 
+logger = logging.getLogger(__name__)
+audit_logger = logging.getLogger("audit")
+security_logger = logging.getLogger("app.security")
+
 
 @router.post(
     "/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED
@@ -31,7 +38,6 @@ limiter = Limiter(key_func=get_remote_address)
 async def register(
     request: Request,
     data: LoginRequest,
-    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -41,11 +47,15 @@ async def register(
     try:
         user = await register_user(db, data)
     except ConflictError as e:
-        # Let FastAPI handle ConflictError, it will return 409
         raise e
     access = await create_access_token_for_user(user)
     refresh = await create_refresh_token_for_user(user)
-    response.set_cookie(
+    resp = auto_response(
+        request,
+        {"access_token": access, "refresh_token": "stored in httpOnly cookie"},
+        status.HTTP_201_CREATED,
+    )
+    resp.set_cookie(
         key="refresh_token",
         value=refresh,
         httponly=True,
@@ -53,11 +63,7 @@ async def register(
         samesite="strict",
         max_age=settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
     )
-    return auto_response(
-        request,
-        {"access_token": access, "refresh_token": "stored in httpOnly cookie"},
-        status.HTTP_201_CREATED,
-    )
+    return resp
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -65,7 +71,6 @@ async def register(
 async def login(
     request: Request,
     data: LoginRequest,
-    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -79,7 +84,10 @@ async def login(
         raise e
     access = await create_access_token_for_user(user)
     refresh = await create_refresh_token_for_user(user)
-    response.set_cookie(
+    resp = auto_response(
+        request, {"access_token": access, "refresh_token": "stored in httpOnly cookie"}
+    )
+    resp.set_cookie(
         key="refresh_token",
         value=refresh,
         httponly=True,
@@ -87,16 +95,12 @@ async def login(
         samesite="strict",
         max_age=settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
     )
-    return auto_response(
-        request, {"access_token": access, "refresh_token": "stored in httpOnly cookie"}
-    )
+    return resp
 
 
 @router.post("/refresh", response_model=TokenResponse)
 @limiter.limit(settings.RATE_LIMIT_REFRESH)
-async def refresh(
-    request: Request, response: Response, db: AsyncSession = Depends(get_db)
-):
+async def refresh(request: Request, db: AsyncSession = Depends(get_db)):
     """
     Rotate tokens:
     - Extract refresh token from cookie
@@ -106,27 +110,36 @@ async def refresh(
     """
     token = request.cookies.get("refresh_token")
     if not token:
+        security_logger.warning("Refresh token missing in request cookies")
         raise UnauthorizedError("Refresh token missing")
     if await is_refresh_token_revoked(token):
+        security_logger.warning("Refresh token revoked (possibly reused or stolen)")
         raise UnauthorizedError("Refresh token revoked")
 
     try:
         payload: dict[str, Any] = decode_refresh_token(token)
         user_id = payload.get("sub")
         if not isinstance(user_id, str):
+            security_logger.warning("Invalid refresh token payload (no sub)")
             raise UnauthorizedError("Invalid token payload")
     except Exception:
+        security_logger.warning("Invalid refresh token (decode error)")
         raise UnauthorizedError("Invalid refresh token")
 
     user = await get_user_by_id(db, user_id)
     if not user or not user.is_active:
+        security_logger.warning("Refresh token: invalid user id=%s", user_id)
         raise UnauthorizedError("Invalid user")
 
     await revoke_refresh_token(token)
 
     new_access = await create_access_token_for_user(user)
     new_refresh = await create_refresh_token_for_user(user)
-    response.set_cookie(
+    resp = auto_response(
+        request,
+        {"access_token": new_access, "refresh_token": "stored in httpOnly cookie"},
+    )
+    resp.set_cookie(
         key="refresh_token",
         value=new_refresh,
         httponly=True,
@@ -134,10 +147,11 @@ async def refresh(
         samesite="strict",
         max_age=settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
     )
-    return auto_response(
-        request,
-        {"access_token": new_access, "refresh_token": "stored in httpOnly cookie"},
+    logger.info("Token refreshed for user: id=%s username=%s", user.id, user.username)
+    audit_logger.info(
+        "Token refresh: id=%s username=%s email=%s", user.id, user.username, user.email
     )
+    return resp
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -148,4 +162,8 @@ async def logout(request: Request):
     token = request.cookies.get("refresh_token")
     if token:
         await revoke_refresh_token(token)
+        logger.info("User logged out: refresh token revoked")
+        audit_logger.info("User logout (refresh token revoked)")
+    else:
+        security_logger.warning("Logout called with no refresh token present")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
