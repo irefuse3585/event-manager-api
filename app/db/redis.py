@@ -1,11 +1,10 @@
-from typing import AsyncGenerator
+# app/db/redis.py
 
 import aioredis
 
 from app.core.config import settings
 
 # Create a global Redis client instance.
-# decode_responses=True to get Python strings instead of bytes.
 redis_client = aioredis.from_url(
     settings.REDIS_URL,
     encoding="utf-8",
@@ -13,14 +12,10 @@ redis_client = aioredis.from_url(
 )
 
 
-async def get_redis() -> AsyncGenerator[aioredis.Redis, None]:
+async def get_redis():
     """
     FastAPI dependency that yields a Redis client.
-
-    Yields:
-        aioredis.Redis: shared Redis connection.
-
-    Since aioredis maintains its own connection pool internally,
-    we simply yield the singleton instance.
+    Ensures Redis is alive before yielding client.
     """
+    await redis_client.ping()
     yield redis_client
