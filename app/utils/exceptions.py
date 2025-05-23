@@ -41,3 +41,13 @@ class NotFoundError(HTTPException):
 
     def __init__(self, detail: str = "Not found"):
         super().__init__(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+
+
+class ServiceUnavailableError(HTTPException):
+    """
+    Raised when a required service (DB, Redis, etc.) is unavailable.
+    Returns HTTP 503.
+    """
+
+    def __init__(self, detail: str = "Service temporarily unavailable"):
+        super().__init__(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail)
