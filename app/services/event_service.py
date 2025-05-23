@@ -18,6 +18,10 @@ from app.utils.exceptions import (
     NotFoundError,
     ServiceUnavailableError,
 )
+from app.utils.notifications import (
+    get_event_participant_user_ids,
+    notify_event_users_for_ids,
+)
 
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("audit")
@@ -41,7 +45,7 @@ async def get_user_event_permission(
 async def create_event(db: AsyncSession, user_id: uuid.UUID, data: dict) -> Event:
     """Create a new event with time overlap detection."""
     try:
-        # Conflict detection
+        # Conflict detection for overlapping events
         stmt = (
             select(Event)
             .where(Event.owner_id == user_id)
@@ -52,7 +56,7 @@ async def create_event(db: AsyncSession, user_id: uuid.UUID, data: dict) -> Even
         if overlapping.scalars().first():
             raise ConflictError("Event time overlaps with existing event")
 
-        # Create event + owner permission
+        # Create event and add owner permission
         event = Event(**data, owner_id=user_id)
         db.add(event)
         await db.flush()
@@ -63,7 +67,7 @@ async def create_event(db: AsyncSession, user_id: uuid.UUID, data: dict) -> Even
         await db.commit()
         await db.refresh(event)
 
-        # Load permissions
+        # Load permissions (for response consistency)
         stmt = (
             select(Event)
             .options(selectinload(Event.permissions))
@@ -76,6 +80,7 @@ async def create_event(db: AsyncSession, user_id: uuid.UUID, data: dict) -> Even
 
         logger.info("Event created: id=%s by user=%s", created.id, user_id)
         audit_logger.info("Event created: id=%s by user=%s", created.id, user_id)
+        # No WS notifications — only creator has access at creation time
         return created
 
     except SQLAlchemyError as exc:
@@ -134,6 +139,7 @@ async def create_events_batch(
         audit_logger.info(
             "Batch event creation: count=%d by user=%s", len(events_with_perms), user_id
         )
+        # No WS notifications — only creator has access at creation time
         return events_with_perms
 
     except SQLAlchemyError as exc:
@@ -190,7 +196,10 @@ async def list_events(
 async def update_event(
     db: AsyncSession, user_id: uuid.UUID, event_id: uuid.UUID, data: dict
 ) -> Event:
-    """Update event (OWNER/EDITOR), checking for time overlap."""
+    """
+    Update event (OWNER/EDITOR), checking for time overlap.
+    Notify all participants except initiator.
+    """
     perm = await get_user_event_permission(db, user_id, event_id)
     if not perm or perm.role not in (
         PermissionRole.OWNER,
@@ -199,7 +208,7 @@ async def update_event(
         raise ForbiddenError("You do not have permission to update this event")
 
     try:
-        # Conflict detection
+        # Check for time conflicts if start_time and end_time are being updated
         if "start_time" in data and "end_time" in data:
             stmt = (
                 select(Event)
@@ -212,7 +221,7 @@ async def update_event(
             if overlapping.scalars().first():
                 raise ConflictError("Event time overlaps with existing event")
 
-        # Load, update, commit
+        # Load, update, and commit
         stmt = (
             select(Event)
             .options(selectinload(Event.permissions))
@@ -231,6 +240,18 @@ async def update_event(
 
         logger.info("Event updated: id=%s by user=%s", event_id, user_id)
         audit_logger.info("Event updated: id=%s by user=%s", event_id, user_id)
+
+        # Notify all participants except initiator
+        user_ids = await get_event_participant_user_ids(event_id, db)
+        user_ids = [uid for uid in user_ids if uid != str(user_id)]
+        notification = {
+            "type": "event_updated",
+            "event_id": str(event_id),
+            "initiator_id": str(user_id),
+            "message": f"Event '{event.title}' updated by user {user_id}",
+        }
+        if user_ids:
+            await notify_event_users_for_ids(user_ids, notification)
         return event
 
     except SQLAlchemyError as exc:
@@ -240,8 +261,10 @@ async def update_event(
 
 
 async def delete_event(db: AsyncSession, user_id: uuid.UUID, event_id: uuid.UUID):
-    """Delete event (OWNER only)."""
-    # 1) Attempt to load the event from the database
+    """
+    Delete event (OWNER only).
+    Notify all participants except initiator.
+    """
     try:
         stmt = (
             select(Event)
@@ -251,28 +274,35 @@ async def delete_event(db: AsyncSession, user_id: uuid.UUID, event_id: uuid.UUID
         result = await db.execute(stmt)
         event = result.scalars().first()
     except SQLAlchemyError as exc:
-        # If any database error occurs during lookup, abort with 503
         logger.error("DB error during event lookup: %s", exc, exc_info=True)
         raise ServiceUnavailableError("Database temporarily unavailable")
 
-    # 2) If the event does not exist, return 404
     if not event:
         raise NotFoundError("Event not found")
 
-    # 3) Check that the user holds OWNER permission on this event
     perm = await get_user_event_permission(db, user_id, event_id)
     if not perm or perm.role != PermissionRole.OWNER:
-        # User is not authorized to delete this event
         raise ForbiddenError("You do not have permission to delete this event")
 
-    # 4) Proceed to delete the event and commit the transaction
     try:
         await db.delete(event)
         await db.commit()
         logger.info("Event deleted: id=%s by user=%s", event_id, user_id)
         audit_logger.info("Event deleted: id=%s by user=%s", event_id, user_id)
+
+        # Notify all participants except initiator
+        user_ids = await get_event_participant_user_ids(event_id, db)
+        user_ids = [uid for uid in user_ids if uid != str(user_id)]
+        notification = {
+            "type": "event_deleted",
+            "event_id": str(event_id),
+            "initiator_id": str(user_id),
+            "message": f"Event '{event.title}' deleted by user {user_id}",
+        }
+        if user_ids:
+            await notify_event_users_for_ids(user_ids, notification)
+
     except SQLAlchemyError as exc:
-        # Roll back if deletion fails
         await db.rollback()
         logger.error("DB error during event delete: %s", exc, exc_info=True)
         raise ServiceUnavailableError("Database temporarily unavailable")
@@ -287,6 +317,7 @@ async def grant_event_permissions(
     """
     Bulk grant permissions for an event. Only OWNER can grant.
     items: list of dicts with keys "user_id" and "role".
+    Notify only new grantees, not the owner/initiator.
     """
     owner_perm = await get_user_event_permission(db, current_user_id, event_id)
     if not owner_perm or owner_perm.role != PermissionRole.OWNER:
@@ -299,7 +330,7 @@ async def grant_event_permissions(
             role = PermissionRole(data["role"])
             if uid == current_user_id:
                 continue
-            # avoid duplicates
+            # Check for duplicate permissions
             stmt = select(Permission).where(
                 Permission.event_id == event_id,
                 Permission.user_id == uid,
@@ -321,6 +352,20 @@ async def grant_event_permissions(
         audit_logger.info(
             "Permissions granted on event %s by user %s", event_id, current_user_id
         )
+
+        # Notify only new grantees (not the owner)
+        for p in created:
+            notification = {
+                "type": "permission_granted",
+                "event_id": str(event_id),
+                "initiator_id": str(current_user_id),
+                "user_id": str(p.user_id),
+                "role": p.role.value,
+                "message": f"You have been granted {p.role.value} access to event"
+                f"{event_id} by user {current_user_id}",
+            }
+            await notify_event_users_for_ids([str(p.user_id)], notification)
+
         return created
 
     except SQLAlchemyError as exc:

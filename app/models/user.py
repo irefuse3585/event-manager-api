@@ -1,3 +1,5 @@
+# app/models/user.py
+
 import uuid
 
 from sqlalchemy import Boolean

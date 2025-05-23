@@ -1,3 +1,5 @@
+# app/models/permission.py
+
 import uuid
 
 from sqlalchemy import Enum as SAEnum

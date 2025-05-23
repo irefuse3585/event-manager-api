@@ -3,7 +3,7 @@
 import logging
 from typing import Any, Callable
 
-from fastapi import Depends
+from fastapi import Depends, WebSocket, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -76,3 +76,44 @@ def require_role(required_role: UserRole) -> Callable:
         return user
 
     return role_checker
+
+
+async def get_current_user_ws(websocket: WebSocket):
+    """
+    Extract and validate user for WebSocket authentication.
+    Close the connection if the user is not authorized.
+    """
+    token = None
+    for name, value in websocket.headers.items():
+        if name.lower() == "authorization" and value.startswith("Bearer "):
+            token = value[7:]
+            break
+
+    if not token:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        raise UnauthorizedError("Missing or invalid Authorization header")
+
+    if await redis_client.get(f"revoked_token:{token}"):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        raise UnauthorizedError("Token has been revoked")
+
+    try:
+        payload = decode_access_token(token)
+    except Exception as exc:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        raise UnauthorizedError("Invalid token") from exc
+
+    user_id = payload.get("sub")
+    if not isinstance(user_id, str):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        raise UnauthorizedError("Invalid token payload")
+
+    async for db in get_db():
+        user = await get_user_by_id(db, user_id)
+        break
+
+    if not user or not user.is_active:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        raise UnauthorizedError("Inactive or non-existent user")
+
+    return user
