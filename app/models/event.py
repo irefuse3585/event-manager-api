@@ -1,3 +1,5 @@
+# app/models/event.py
+
 import uuid
 from datetime import datetime
 
@@ -29,6 +31,9 @@ class Event(Base):
         DateTime(timezone=True), nullable=False
     )
     end_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # Location (optional, max 255 chars)
+    location: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Recurrence flags
     is_recurring: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
