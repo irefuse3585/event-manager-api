@@ -4,7 +4,9 @@ import uuid
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from dateutil.rrule import rrulestr
+from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 
 class EventBase(BaseModel):
@@ -18,10 +20,23 @@ class EventBase(BaseModel):
         None, max_length=100, examples=["RRULE:FREQ=WEEKLY;BYDAY=MO"]
     )
 
+    @field_validator("recurrence_pattern")
+    def validate_recurrence_pattern(cls, v):
+        if v is not None:
+            try:
+                rrulestr(v)
+            except Exception:
+                raise PydanticCustomError(
+                    "invalid_rrule", "recurrence_pattern must be a valid RRULE string"
+                )
+        return v
+
     @model_validator(mode="after")
     def check_times(self):
         if self.start_time and self.end_time and self.end_time <= self.start_time:
-            raise ValueError("end_time must be after start_time")
+            raise PydanticCustomError(
+                "invalid_time_order", "end_time must be after start_time"
+            )
         return self
 
 
@@ -41,6 +56,17 @@ class EventUpdate(BaseModel):
     location: Optional[str] = None
     is_recurring: Optional[bool] = None
     recurrence_pattern: Optional[str] = Field(None, max_length=100)
+
+    @field_validator("recurrence_pattern")
+    def validate_recurrence_pattern(cls, v):
+        if v is not None:
+            try:
+                rrulestr(v)
+            except Exception:
+                raise PydanticCustomError(
+                    "invalid_rrule", "recurrence_pattern must be a valid RRULE string"
+                )
+        return v
 
 
 class PermissionRead(BaseModel):
