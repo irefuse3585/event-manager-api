@@ -1,5 +1,7 @@
 # app/main.py
 
+import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 
@@ -18,11 +20,14 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from app.api.auth import router as auth_router
 from app.api.events import router as events_router
 from app.api.permissions import router as permissions_router
+from app.api.ws_notifications import redis_listener
+from app.api.ws_notifications import router as ws_notifications_router
 from app.core.logging import init_logging
 from app.db.redis import redis_client
 from app.db.session import engine
 from app.models.user import User, UserRole
-from app.utils.deps import require_role
+from app.schemas.user import UserRead
+from app.utils.deps import get_current_user, require_role
 from app.utils.exceptions import ServiceUnavailableError
 
 
@@ -143,18 +148,23 @@ def add_global_exception_handlers(app: FastAPI):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    On startup: init logging, check Redis/Postgres.
-    On shutdown: log shutdown.
+    On startup: init logging, check Redis/Postgres, start Redis listener.
+    On shutdown: stop Redis listener and log shutdown.
     """
+    # initialize logging configuration
     init_logging()
     logger = logging.getLogger("app.main")
     logger.info("Starting FastAPI application")
+
+    # check Redis connectivity
     try:
         await redis_client.ping()
         logger.info("Successfully connected to Redis.")
     except Exception as exc:
         logger.critical("Failed to connect to Redis: %s", exc, exc_info=True)
         raise ServiceUnavailableError("Redis temporarily unavailable")
+
+    # check Postgres connectivity
     try:
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
@@ -163,8 +173,19 @@ async def lifespan(app: FastAPI):
         logger.critical("Failed to connect to DB: %s", exc, exc_info=True)
         raise ServiceUnavailableError("Database temporarily unavailable")
 
+    # start background Redis listener for WebSocket notifications
+    app.state.redis_task = asyncio.create_task(redis_listener())
+
+    # yield control to FastAPI to start serving requests
     yield
 
+    # shutdown: cancel Redis listener task
+    task = app.state.redis_task
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    logger.info("Redis listener stopped")
     logger.info("Shutting down FastAPI application.")
 
 
@@ -177,16 +198,19 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json",
         lifespan=lifespan,
     )
+
+    # register global exception handlers
     add_global_exception_handlers(app)
 
     # Register MessagePack middleware
     app.add_middleware(MessagePackMiddleware)
 
-    # Rate limiting
+    # Rate limiting middleware
     limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
     app.state.limiter = limiter
     app.add_middleware(SlowAPIMiddleware)
 
+    # health check endpoint
     @app.get("/health", tags=["Health"])
     async def health_check() -> dict:
         logger = logging.getLogger("app.main")
@@ -210,15 +234,27 @@ def create_app() -> FastAPI:
             "db": db_status,
         }
 
+    # admin-area endpoint
     @app.get("/admin-area", tags=["Admin"])
     async def admin_area(current_user: User = Depends(require_role(UserRole.ADMIN))):
         logger = logging.getLogger("app.main")
         logger.info("Admin-area accessed by user: %s", current_user.username)
         return {"msg": f"Hello, admin {current_user.username}!"}
 
+    # user self-info endpoint
+    @app.get("/me", response_model=UserRead, tags=["User"])
+    async def read_current_user(current_user: User = Depends(get_current_user)):
+        """
+        Returns information about the current authenticated user.
+        """
+        return current_user
+
+    # include routers
     app.include_router(auth_router)
     app.include_router(events_router)
     app.include_router(permissions_router)
+    app.include_router(ws_notifications_router)
+
     return app
 
 
