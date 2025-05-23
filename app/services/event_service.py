@@ -1,3 +1,5 @@
+# app/services/event_service.py
+
 import logging
 import uuid
 from typing import List, Optional
@@ -273,4 +275,55 @@ async def delete_event(db: AsyncSession, user_id: uuid.UUID, event_id: uuid.UUID
         # Roll back if deletion fails
         await db.rollback()
         logger.error("DB error during event delete: %s", exc, exc_info=True)
+        raise ServiceUnavailableError("Database temporarily unavailable")
+
+
+async def grant_event_permissions(
+    db: AsyncSession,
+    current_user_id: uuid.UUID,
+    event_id: uuid.UUID,
+    items: List[dict],
+) -> List[Permission]:
+    """
+    Bulk grant permissions for an event. Only OWNER can grant.
+    items: list of dicts with keys "user_id" and "role".
+    """
+    owner_perm = await get_user_event_permission(db, current_user_id, event_id)
+    if not owner_perm or owner_perm.role != PermissionRole.OWNER:
+        raise ForbiddenError("Only owner can share the event")
+
+    created: List[Permission] = []
+    try:
+        for data in items:
+            uid = data["user_id"]
+            role = PermissionRole(data["role"])
+            if uid == current_user_id:
+                continue
+            # avoid duplicates
+            stmt = select(Permission).where(
+                Permission.event_id == event_id,
+                Permission.user_id == uid,
+            )
+            exists = (await db.execute(stmt)).scalars().first()
+            if exists:
+                raise ConflictError(f"Permission already exists for user {uid}")
+            perm = Permission(user_id=uid, event_id=event_id, role=role)
+            db.add(perm)
+            created.append(perm)
+
+        await db.commit()
+        for p in created:
+            await db.refresh(p)
+
+        logger.info(
+            "Permissions granted on event %s by user %s", event_id, current_user_id
+        )
+        audit_logger.info(
+            "Permissions granted on event %s by user %s", event_id, current_user_id
+        )
+        return created
+
+    except SQLAlchemyError as exc:
+        await db.rollback()
+        logger.error("DB error in grant_event_permissions: %s", exc, exc_info=True)
         raise ServiceUnavailableError("Database temporarily unavailable")
