@@ -45,6 +45,7 @@ pydantic[email]
 pydantic-settings==2.9.1
 pydantic_core==2.33.2
 pyflakes==3.3.2
+python-dateutil==2.9.0.post0
 python-dotenv==1.1.0
 python-jose==3.4.0
 PyYAML==6.0.2
