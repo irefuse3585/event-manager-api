@@ -2,7 +2,7 @@
 
 from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -26,6 +26,18 @@ class LoginRequest(BaseModel):
         if not values.get("username") and not values.get("email"):
             raise ValueError("Either username or email must be provided")
         return values
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(
+        ..., examples=["john_doe"], description="Username for register"
+    )
+    email: EmailStr = Field(
+        ..., examples=["john@example.com"], description="Email for register"
+    )
+    password: str = Field(
+        ..., examples=["StrongPassword123!"], description="User's password"
+    )
 
 
 class TokenResponse(BaseModel):
