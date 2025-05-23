@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import (
@@ -15,53 +16,58 @@ from app.core.security import (
 )
 from app.db.redis import redis_client
 from app.models.user import User
-from app.schemas.auth import LoginRequest
-from app.utils.exceptions import ConflictError, UnauthorizedError
+from app.schemas.auth import LoginRequest, RegisterRequest
+from app.utils.exceptions import (
+    ConflictError,
+    ServiceUnavailableError,
+    UnauthorizedError,
+)
 
-# Regular logger for internal operations
 logger = logging.getLogger(__name__)
-# Audit logger for tracking user-related actions
 audit_logger = logging.getLogger("audit")
-# Security logger for warnings and auth failures (optional)
 security_logger = logging.getLogger("app.security")
 
 
-async def register_user(db: AsyncSession, data: LoginRequest) -> User:
+async def register_user(db: AsyncSession, data: RegisterRequest) -> User:
     """
     Register a new user:
     - ensure username or email is unique
     - hash the password
     - insert into DB
     """
-    stmt = select(User).where(
-        (User.username == data.username) | (User.email == data.email)
-    )
-    existing_user = (await db.execute(stmt)).scalars().first()
-    if existing_user:
-        security_logger.warning(
-            "Registration attempt with existing username or email: %s, %s",
-            data.username,
-            data.email,
+    try:
+        stmt = select(User).where(
+            (User.username == data.username) | (User.email == data.email)
         )
-        raise ConflictError("Username or email already registered")
+        existing_user = (await db.execute(stmt)).scalars().first()
+        if existing_user:
+            security_logger.warning(
+                "Registration attempt with existing username or email: %s, %s",
+                data.username,
+                data.email,
+            )
+            raise ConflictError("Username or email already registered")
 
-    hashed_password = get_password_hash(data.password)
-    new_user = User(
-        username=data.username, email=data.email, hashed_password=hashed_password
-    )
-    db.add(new_user)
-    await db.commit()
-    await db.refresh(new_user)
-    logger.info(
-        "User registered successfully: id=%s username=%s",
-        new_user.id,
-        new_user.username,
-    )
-    audit_logger.info(
-        f"User registered: id={new_user.id} username={new_user.username} "
-        f"email={new_user.email}"
-    )
-    return new_user
+        hashed_password = get_password_hash(data.password)
+        new_user = User(
+            username=data.username, email=data.email, hashed_password=hashed_password
+        )
+        db.add(new_user)
+        await db.commit()
+        await db.refresh(new_user)
+        logger.info(
+            "User registered successfully: id=%s username=%s",
+            new_user.id,
+            new_user.username,
+        )
+        audit_logger.info(
+            f"User registered: id={new_user.id} username={new_user.username} "
+            f"email={new_user.email}"
+        )
+        return new_user
+    except SQLAlchemyError as exc:
+        logger.error("DB error during user registration: %s", exc, exc_info=True)
+        raise ServiceUnavailableError("Database temporarily unavailable")
 
 
 async def authenticate_user(db: AsyncSession, data: LoginRequest) -> User:
@@ -70,10 +76,14 @@ async def authenticate_user(db: AsyncSession, data: LoginRequest) -> User:
     - lookup by username or email
     - verify password match
     """
-    stmt = select(User).where(
-        (User.username == data.username) | (User.email == data.email)
-    )
-    user = (await db.execute(stmt)).scalars().first()
+    try:
+        stmt = select(User).where(
+            (User.username == data.username) | (User.email == data.email)
+        )
+        user = (await db.execute(stmt)).scalars().first()
+    except SQLAlchemyError as exc:
+        logger.error("DB error during user authentication: %s", exc, exc_info=True)
+        raise ServiceUnavailableError("Database temporarily unavailable")
     if not user or not verify_password(data.password, user.hashed_password):
         security_logger.warning(
             "Failed login attempt for username=%s or email=%s",
@@ -92,12 +102,18 @@ async def get_user_by_id(db: AsyncSession, user_id: str) -> User | None:
     """
     Fetch user by UUID (string).
     """
-    user = (await db.execute(select(User).where(User.id == user_id))).scalars().first()
-    if user:
-        logger.debug("Fetched user by id: %s", user_id)
-    else:
-        logger.warning("User not found by id: %s", user_id)
-    return user
+    try:
+        user = (
+            (await db.execute(select(User).where(User.id == user_id))).scalars().first()
+        )
+        if user:
+            logger.debug("Fetched user by id: %s", user_id)
+        else:
+            logger.warning("User not found by id: %s", user_id)
+        return user
+    except SQLAlchemyError as exc:
+        logger.error("DB error in get_user_by_id: %s", exc, exc_info=True)
+        raise ServiceUnavailableError("Database temporarily unavailable")
 
 
 async def create_access_token_for_user(user: User) -> str:
@@ -112,12 +128,16 @@ async def create_refresh_token_for_user(user: User) -> str:
     """
     Issue refresh token and store its jti in Redis.
     """
-    token, jti = create_refresh_token(subject=str(user.id))
-    payload = decode_refresh_token(token)
-    ttl = payload["exp"] - int(datetime.utcnow().timestamp())
-    await redis_client.set(f"refresh:jti:{jti}", str(user.id), ex=ttl)
-    logger.debug("Refresh token issued and stored in Redis for user_id=%s", user.id)
-    return token
+    try:
+        token, jti = create_refresh_token(subject=str(user.id))
+        payload = decode_refresh_token(token)
+        ttl = payload["exp"] - int(datetime.utcnow().timestamp())
+        await redis_client.set(f"refresh:jti:{jti}", str(user.id), ex=ttl)
+        logger.debug("Refresh token issued and stored in Redis for user_id=%s", user.id)
+        return token
+    except Exception as exc:
+        logger.error("Redis error during refresh token issue: %s", exc, exc_info=True)
+        raise ServiceUnavailableError("Redis temporarily unavailable")
 
 
 async def revoke_refresh_token(token: str) -> None:
@@ -131,9 +151,15 @@ async def revoke_refresh_token(token: str) -> None:
         logger.warning("Attempted to revoke invalid refresh token")
         return
     if jti:
-        await redis_client.delete(f"refresh:jti:{jti}")
-        logger.info("Refresh token revoked: jti=%s", jti)
-        audit_logger.info(f"Refresh token revoked: jti={jti}")
+        try:
+            await redis_client.delete(f"refresh:jti:{jti}")
+            logger.info("Refresh token revoked: jti=%s", jti)
+            audit_logger.info(f"Refresh token revoked: jti={jti}")
+        except Exception as exc:
+            logger.error(
+                "Redis error during refresh token revoke: %s", exc, exc_info=True
+            )
+            raise ServiceUnavailableError("Redis temporarily unavailable")
 
 
 async def is_refresh_token_revoked(token: str) -> bool:
@@ -149,6 +175,10 @@ async def is_refresh_token_revoked(token: str) -> bool:
     if not jti:
         logger.warning("Token revoked check: missing jti")
         return True
-    exists = await redis_client.exists(f"refresh:jti:{jti}")
-    logger.debug("Refresh token jti=%s exists in Redis: %s", jti, bool(exists))
-    return not bool(exists)
+    try:
+        exists = await redis_client.exists(f"refresh:jti:{jti}")
+        logger.debug("Refresh token jti=%s exists in Redis: %s", jti, bool(exists))
+        return not bool(exists)
+    except Exception as exc:
+        logger.error("Redis error during token revoked check: %s", exc, exc_info=True)
+        raise ServiceUnavailableError("Redis temporarily unavailable")
