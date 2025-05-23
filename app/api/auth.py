@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.security import decode_refresh_token
 from app.db.session import get_db
-from app.schemas.auth import LoginRequest, TokenResponse
+from app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse
 from app.services.auth_service import (
     authenticate_user,
     create_access_token_for_user,
@@ -21,8 +21,7 @@ from app.services.auth_service import (
     register_user,
     revoke_refresh_token,
 )
-from app.utils.exceptions import ConflictError, UnauthorizedError
-from app.utils.response import auto_response
+from app.utils.exceptions import UnauthorizedError
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 limiter = Limiter(key_func=get_remote_address)
@@ -36,26 +35,17 @@ security_logger = logging.getLogger("app.security")
     "/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED
 )
 async def register(
-    request: Request,
-    data: LoginRequest,
+    data: RegisterRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Register user and issue both tokens, storing refresh token in httpOnly cookie.
-    Returns either JSON or MessagePack response.
+    Register a new user and issue both tokens, setting refresh in httpOnly cookie.
     """
-    try:
-        user = await register_user(db, data)
-    except ConflictError as e:
-        raise e
+    user = await register_user(db, data)
     access = await create_access_token_for_user(user)
     refresh = await create_refresh_token_for_user(user)
-    resp = auto_response(
-        request,
-        {"access_token": access, "refresh_token": "stored in httpOnly cookie"},
-        status.HTTP_201_CREATED,
-    )
-    resp.set_cookie(
+    response.set_cookie(
         key="refresh_token",
         value=refresh,
         httponly=True,
@@ -63,7 +53,11 @@ async def register(
         samesite="strict",
         max_age=settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
     )
-    return resp
+    return TokenResponse(
+        access_token=access,
+        refresh_token="stored in httpOnly cookie",
+        token_type="bearer",
+    )
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -71,23 +65,16 @@ async def register(
 async def login(
     request: Request,
     data: LoginRequest,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Authenticate user and return new tokens.
-    Sets refresh token in httpOnly cookie.
-    Supports both JSON and MessagePack response formats.
+    Authenticate user and return new tokens, setting refresh in httpOnly cookie.
     """
-    try:
-        user = await authenticate_user(db, data)
-    except UnauthorizedError as e:
-        raise e
+    user = await authenticate_user(db, data)
     access = await create_access_token_for_user(user)
     refresh = await create_refresh_token_for_user(user)
-    resp = auto_response(
-        request, {"access_token": access, "refresh_token": "stored in httpOnly cookie"}
-    )
-    resp.set_cookie(
+    response.set_cookie(
         key="refresh_token",
         value=refresh,
         httponly=True,
@@ -95,32 +82,36 @@ async def login(
         samesite="strict",
         max_age=settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
     )
-    return resp
+    return TokenResponse(
+        access_token=access,
+        refresh_token="stored in httpOnly cookie",
+        token_type="bearer",
+    )
 
 
 @router.post("/refresh", response_model=TokenResponse)
 @limiter.limit(settings.RATE_LIMIT_REFRESH)
-async def refresh(request: Request, db: AsyncSession = Depends(get_db)):
+async def refresh(
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
     """
-    Rotate tokens:
-    - Extract refresh token from cookie
-    - Validate and revoke old token
-    - Issue new tokens and set new cookie
-    Returns either JSON or MessagePack depending on Accept header.
+    Rotate tokens: extract, validate, revoke old refresh, issue new pair.
     """
     token = request.cookies.get("refresh_token")
     if not token:
         security_logger.warning("Refresh token missing in request cookies")
         raise UnauthorizedError("Refresh token missing")
     if await is_refresh_token_revoked(token):
-        security_logger.warning("Refresh token revoked (possibly reused or stolen)")
+        security_logger.warning("Refresh token revoked or reused")
         raise UnauthorizedError("Refresh token revoked")
 
     try:
         payload: dict[str, Any] = decode_refresh_token(token)
         user_id = payload.get("sub")
         if not isinstance(user_id, str):
-            security_logger.warning("Invalid refresh token payload (no sub)")
+            security_logger.warning("Invalid refresh token payload")
             raise UnauthorizedError("Invalid token payload")
     except Exception:
         security_logger.warning("Invalid refresh token (decode error)")
@@ -132,14 +123,9 @@ async def refresh(request: Request, db: AsyncSession = Depends(get_db)):
         raise UnauthorizedError("Invalid user")
 
     await revoke_refresh_token(token)
-
     new_access = await create_access_token_for_user(user)
     new_refresh = await create_refresh_token_for_user(user)
-    resp = auto_response(
-        request,
-        {"access_token": new_access, "refresh_token": "stored in httpOnly cookie"},
-    )
-    resp.set_cookie(
+    response.set_cookie(
         key="refresh_token",
         value=new_refresh,
         httponly=True,
@@ -151,13 +137,20 @@ async def refresh(request: Request, db: AsyncSession = Depends(get_db)):
     audit_logger.info(
         "Token refresh: id=%s username=%s email=%s", user.id, user.username, user.email
     )
-    return resp
+    return TokenResponse(
+        access_token=new_access,
+        refresh_token="stored in httpOnly cookie",
+        token_type="bearer",
+    )
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-async def logout(request: Request):
+async def logout(
+    request: Request,
+    response: Response,
+):
     """
-    Revoke provided refresh token from cookie.
+    Revoke provided refresh token from cookie and clear cookie.
     """
     token = request.cookies.get("refresh_token")
     if token:
@@ -166,4 +159,13 @@ async def logout(request: Request):
         audit_logger.info("User logout (refresh token revoked)")
     else:
         security_logger.warning("Logout called with no refresh token present")
+    # Clear the cookie
+    response.delete_cookie(
+        key="refresh_token",
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        path="/",
+    )
+    # 204 responses should have no body (just status)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
