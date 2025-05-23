@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from datetime import datetime
 from typing import List, Optional
 
 from sqlalchemy import select
@@ -11,6 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from app.models.enums import PermissionRole
 from app.models.event import Event
+from app.models.history import History
 from app.models.permission import Permission
 from app.utils.exceptions import (
     ConflictError,
@@ -27,10 +29,23 @@ logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("audit")
 
 
+def to_uuid(x):
+    if isinstance(x, uuid.UUID):
+        return x
+    elif isinstance(x, str):
+        return uuid.UUID(x)
+    elif hasattr(x, "__uuid__"):
+        return uuid.UUID(str(x))
+    else:
+        return uuid.UUID(str(x))
+
+
 async def get_user_event_permission(
-    db: AsyncSession, user_id: uuid.UUID, event_id: uuid.UUID
+    db: AsyncSession, user_id, event_id
 ) -> Optional[Permission]:
     """Return Permission for a user and event, or None if not found."""
+    user_id = to_uuid(user_id)
+    event_id = to_uuid(event_id)
     try:
         stmt = select(Permission).where(
             Permission.user_id == user_id, Permission.event_id == event_id
@@ -63,7 +78,24 @@ async def create_event(db: AsyncSession, user_id: uuid.UUID, data: dict) -> Even
 
         perm = Permission(user_id=user_id, event_id=event.id, role=PermissionRole.OWNER)
         db.add(perm)
-
+        current_snapshot = {
+            "title": event.title,
+            "description": event.description,
+            "start_time": event.start_time.isoformat(),
+            "end_time": event.end_time.isoformat(),
+            "location": event.location,
+            "is_recurring": event.is_recurring,
+            "recurrence_pattern": event.recurrence_pattern,
+            "owner_id": str(event.owner_id),
+        }
+        history = History(
+            event_id=event.id,
+            version=1,
+            data=current_snapshot,
+            timestamp=datetime.utcnow(),
+            changed_by=user_id,
+        )
+        db.add(history)
         await db.commit()
         await db.refresh(event)
 
@@ -197,18 +229,17 @@ async def update_event(
     db: AsyncSession, user_id: uuid.UUID, event_id: uuid.UUID, data: dict
 ) -> Event:
     """
-    Update event (OWNER/EDITOR), checking for time overlap.
-    Notify all participants except initiator.
+    Update event if user has permission.
+    Before updating, save current event data as a new History version with attribution.
     """
+
+    # Check permission for update (OWNER or EDITOR)
     perm = await get_user_event_permission(db, user_id, event_id)
-    if not perm or perm.role not in (
-        PermissionRole.OWNER,
-        PermissionRole.EDITOR,
-    ):
+    if not perm or perm.role not in (PermissionRole.OWNER, PermissionRole.EDITOR):
         raise ForbiddenError("You do not have permission to update this event")
 
     try:
-        # Check for time conflicts if start_time and end_time are being updated
+        # Check for time conflict if start and end time are updated
         if "start_time" in data and "end_time" in data:
             stmt = (
                 select(Event)
@@ -221,42 +252,61 @@ async def update_event(
             if overlapping.scalars().first():
                 raise ConflictError("Event time overlaps with existing event")
 
-        # Load, update, and commit
+        # Load event for update
         stmt = (
             select(Event)
-            .options(selectinload(Event.permissions))
             .where(Event.id == event_id)
+            .options(selectinload(Event.permissions))
         )
         result = await db.execute(stmt)
         event = result.scalars().first()
         if not event:
             raise NotFoundError("Event not found")
 
+        # Prepare snapshot of current event data (convert datetime to ISO string)
+        old_data = {
+            "title": event.title,
+            "description": event.description,
+            "start_time": event.start_time.isoformat(),
+            "end_time": event.end_time.isoformat(),
+            "location": event.location,
+            "is_recurring": event.is_recurring,
+            "recurrence_pattern": event.recurrence_pattern,
+            "owner_id": str(event.owner_id),
+        }
+
+        # Get last version number for this event
+        version_stmt = (
+            select(History.version)
+            .where(History.event_id == event_id)
+            .order_by(History.version.desc())
+            .limit(1)
+        )
+        last_version_result = await db.execute(version_stmt)
+        last_version = last_version_result.scalars().first()
+        next_version = 1 if last_version is None else last_version + 1
+
+        # Save snapshot as new History entry
+        history = History(
+            event_id=event_id,
+            version=next_version,
+            data=old_data,
+            timestamp=datetime.utcnow(),
+            changed_by=user_id,
+        )
+        db.add(history)
+
+        # Update event with new data
         for field, val in data.items():
             setattr(event, field, val)
 
         await db.commit()
         await db.refresh(event)
 
-        logger.info("Event updated: id=%s by user=%s", event_id, user_id)
-        audit_logger.info("Event updated: id=%s by user=%s", event_id, user_id)
-
-        # Notify all participants except initiator
-        user_ids = await get_event_participant_user_ids(event_id, db)
-        user_ids = [uid for uid in user_ids if uid != str(user_id)]
-        notification = {
-            "type": "event_updated",
-            "event_id": str(event_id),
-            "initiator_id": str(user_id),
-            "message": f"Event '{event.title}' updated by user {user_id}",
-        }
-        if user_ids:
-            await notify_event_users_for_ids(user_ids, notification)
         return event
 
-    except SQLAlchemyError as exc:
+    except Exception:
         await db.rollback()
-        logger.error("DB error during event update: %s", exc, exc_info=True)
         raise ServiceUnavailableError("Database temporarily unavailable")
 
 
