@@ -19,6 +19,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.api.auth import router as auth_router
 from app.api.events import router as events_router
+from app.api.history import router as history_router
 from app.api.permissions import router as permissions_router
 from app.api.ws_notifications import redis_listener
 from app.api.ws_notifications import router as ws_notifications_router
@@ -254,6 +255,7 @@ def create_app() -> FastAPI:
     app.include_router(events_router)
     app.include_router(permissions_router)
     app.include_router(ws_notifications_router)
+    app.include_router(history_router)
 
     return app
 
