@@ -14,11 +14,13 @@ from app.schemas.event import (
     EventRead,
     EventUpdate,
 )
+from app.schemas.permission import PermissionCreate, PermissionRead
 from app.services.event_service import (
     create_event,
     create_events_batch,
     delete_event,
     get_event,
+    grant_event_permissions,
     list_events,
     update_event,
 )
@@ -58,6 +60,26 @@ async def create_events_batch_endpoint(
     events_data = [event.dict() for event in data.events]
     created_events = await create_events_batch(db, current_user.id, events_data)
     return [EventRead.from_orm(event) for event in created_events]
+
+
+@router.post(
+    "/{event_id}/share",
+    response_model=List[PermissionRead],
+    status_code=status.HTTP_201_CREATED,
+)
+async def share_event(
+    event_id: uuid.UUID,
+    items: List[PermissionCreate],
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    Share an event with other users (grant permissions).
+    Only OWNER may call.
+    """
+    data = [item.dict() for item in items]
+    perms = await grant_event_permissions(db, current_user.id, event_id, data)
+    return [PermissionRead.from_orm(p) for p in perms]
 
 
 @router.get("", response_model=List[EventRead])
