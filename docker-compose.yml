@@ -1,0 +1,46 @@
+services:
+  api:
+    build: .
+    container_name: event-manager-api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./logs:/app/logs
+
+  db:
+    image: postgres:latest
+    # Explicit container name for the Postgres database
+    container_name: event-manager-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: event-manager-pgadmin
+    env_file: .env
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+  redis:
+    image: redis:latest
+    # Explicit container name for the Redis cache
+    container_name: event-manager-redis
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgadmin_data:
