@@ -259,6 +259,8 @@ Open to contributions — just fork and PR!
 
 ---
 
+Task: https://docs.google.com/document/d/1kPhppih_OrYvj_dzzoJIfw6KUL6oK-J35G3z9lc-ois/edit?tab=t.0#heading=h.h8bj1c7g648k
+
 ## 📄 License
 
 MIT
